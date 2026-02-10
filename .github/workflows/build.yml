@@ -1,0 +1,107 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            artifact_name: untar-linux-x86_64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build in Docker for RedHat 7 compatibility
+      run: |
+        # Create Dockerfile for RedHat 7 build
+        cat > Dockerfile.build << 'EOF'
+        FROM centos:7
+        
+        # Switch to CentOS 7 vault repository (since CentOS 7 is EOL)
+        RUN sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo && \
+            sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo
+        
+        # Install build dependencies
+        RUN yum install -y gcc gcc-c++ make curl git which openssl-devel
+        
+        # Install Rust toolchain
+        RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+        
+        # Add Cargo to PATH
+        ENV PATH="/root/.cargo/bin:${PATH}"
+        
+        # Set working directory
+        WORKDIR /build
+        EOF
+        
+        # Build Docker image
+        docker build -f Dockerfile.build -t untar-build:centos7 .
+        
+        # Run build in Docker container
+        docker run --rm \
+          -v $PWD:/build \
+          untar-build:centos7 \
+          bash -c "cargo build --release --target ${{ matrix.target }}"
+
+    - name: Prepare artifact
+      run: |
+        mkdir -p artifacts
+        cp target/${{ matrix.target }}/release/untar artifacts/${{ matrix.artifact_name }}
+        chmod +x artifacts/${{ matrix.artifact_name }}
+        
+        # Clean up temporary files
+        rm -f Dockerfile.build
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: untar-${{ matrix.arch }}
+        path: artifacts/${{ matrix.artifact_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: Prepare release assets
+      run: |
+        cd artifacts
+        for dir in untar-*; do
+          mv $dir/untar-linux-* .
+          rmdir $dir
+        done
+        ls -lh
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/untar-linux-x86_64
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
