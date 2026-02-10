@@ -28,6 +28,7 @@ fn count_single_byte_delimiter(file: File, delimiter_byte: u8) -> Result<usize> 
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut delimiter_count = 0;
     let mut has_content = false;
+    let mut last_byte: Option<u8> = None;
 
     loop {
         let n = reader.read(&mut buffer)?;
@@ -36,11 +37,18 @@ fn count_single_byte_delimiter(file: File, delimiter_byte: u8) -> Result<usize> 
         }
         has_content = true;
         delimiter_count += memchr::memchr_iter(delimiter_byte, &buffer[..n]).count();
+        // 记录最后一个字节
+        last_byte = Some(buffer[n - 1]);
     }
 
-    // 空文件返回0，否则返回段数（分隔符数+1）
+    // 空文件返回0
     if !has_content {
-        Ok(0)
+        return Ok(0);
+    }
+    
+    // 如果最后一个字节是分隔符，段数 = 分隔符数量，否则 = 分隔符数量 + 1
+    if last_byte == Some(delimiter_byte) {
+        Ok(delimiter_count)
     } else {
         Ok(delimiter_count + 1)
     }
@@ -51,6 +59,7 @@ fn count_single_byte_delimiter_stdin(delimiter_byte: u8) -> Result<usize> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut delimiter_count = 0;
     let mut has_content = false;
+    let mut last_byte: Option<u8> = None;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
 
@@ -61,11 +70,18 @@ fn count_single_byte_delimiter_stdin(delimiter_byte: u8) -> Result<usize> {
         }
         has_content = true;
         delimiter_count += memchr::memchr_iter(delimiter_byte, &buffer[..n]).count();
+        // 记录最后一个字节
+        last_byte = Some(buffer[n - 1]);
     }
 
-    // 空输入返回0，否则返回段数（分隔符数+1）
+    // 空输入返回0
     if !has_content {
-        Ok(0)
+        return Ok(0);
+    }
+    
+    // 如果最后一个字节是分隔符，段数 = 分隔符数量，否则 = 分隔符数量 + 1
+    if last_byte == Some(delimiter_byte) {
+        Ok(delimiter_count)
     } else {
         Ok(delimiter_count + 1)
     }
@@ -83,15 +99,17 @@ fn count_multi_byte_delimiter_streaming(
     let mut leftover = String::new();
     let mut delimiter_count = 0;
     let mut has_content = false;
+    let mut last_chunk_ended_with_delimiter = false;
     let delimiter_len = delimiter.len();
 
     loop {
         let n = reader.read(&mut input_buffer)?;
         if n == 0 {
-            // 处理剩余数据
-            if !leftover.is_empty() {
-                delimiter_count += leftover.matches(delimiter).count();
-            }
+            // 处理剩余数据：leftover 总是 combined 的后缀，
+            // 且 combined 已经被扫描过，所以 leftover 不会产生新的匹配，
+            // 除非是跨边界的（但这里是EOF，没有后续了）。
+            // 实际上这里的 leftover 不可能包含完整的 delimiter（否则会在 combined 中被匹配）。
+            // 所以这里不需要再做匹配统计。
             break;
         }
 
@@ -102,7 +120,7 @@ fn count_multi_byte_delimiter_streaming(
         let (_result, _bytes_read, _had_errors) = decoder.decode_to_string(
             &input_buffer[..n],
             &mut output_buffer,
-            n == 0,
+            n == 0, // last chunk? Not necessarily, but EOF triggers break above. This is inside loop.
         );
 
         // 将上次的剩余部分和当前块合并
@@ -114,8 +132,23 @@ fn count_multi_byte_delimiter_streaming(
             temp
         };
 
-        // 统计完整匹配的分隔符
-        delimiter_count += combined.matches(delimiter).count();
+        // 统计完整匹配的分隔符，并检查是否以分隔符结尾
+        let mut chunk_matches = 0;
+        let mut last_match_end = 0;
+        
+        // 使用 match_indices 来获取匹配位置
+        for (idx, _) in combined.match_indices(delimiter) {
+            chunk_matches += 1;
+            last_match_end = idx + delimiter_len;
+        }
+        delimiter_count += chunk_matches;
+        
+        // 更新状态：如果最后一次匹配正好在字符串末尾
+        if chunk_matches > 0 && last_match_end == combined.len() {
+            last_chunk_ended_with_delimiter = true;
+        } else {
+            last_chunk_ended_with_delimiter = false;
+        }
 
         // 保留末尾可能不完整的部分
         leftover.clear();
@@ -125,9 +158,14 @@ fn count_multi_byte_delimiter_streaming(
         }
     }
 
-    // 空文件返回0，否则返回段数（分隔符数+1）
+    // 空文件返回0
     if !has_content {
-        Ok(0)
+        return Ok(0);
+    }
+    
+    // 如果内容以分隔符结尾，段数 = 分隔符数量，否则 = 分隔符数量 + 1
+    if last_chunk_ended_with_delimiter {
+        Ok(delimiter_count)
     } else {
         Ok(delimiter_count + 1)
     }
@@ -145,14 +183,12 @@ fn count_multi_byte_delimiter_stdin(delimiter: &str, encoding: &'static Encoding
     let mut leftover = String::new();
     let mut delimiter_count = 0;
     let mut has_content = false;
+    let mut last_chunk_ended_with_delimiter = false;
     let delimiter_len = delimiter.len();
 
     loop {
         let n = reader.read(&mut input_buffer)?;
         if n == 0 {
-            if !leftover.is_empty() {
-                delimiter_count += leftover.matches(delimiter).count();
-            }
             break;
         }
 
@@ -173,7 +209,20 @@ fn count_multi_byte_delimiter_stdin(delimiter: &str, encoding: &'static Encoding
             temp
         };
 
-        delimiter_count += combined.matches(delimiter).count();
+        let mut chunk_matches = 0;
+        let mut last_match_end = 0;
+        
+        for (idx, _) in combined.match_indices(delimiter) {
+            chunk_matches += 1;
+            last_match_end = idx + delimiter_len;
+        }
+        delimiter_count += chunk_matches;
+
+        if chunk_matches > 0 && last_match_end == combined.len() {
+            last_chunk_ended_with_delimiter = true;
+        } else {
+            last_chunk_ended_with_delimiter = false;
+        }
 
         leftover.clear();
         if combined.len() >= delimiter_len - 1 {
@@ -182,9 +231,14 @@ fn count_multi_byte_delimiter_stdin(delimiter: &str, encoding: &'static Encoding
         }
     }
 
-    // 空输入返回0，否则返回段数（分隔符数+1）
+    // 空输入返回0
     if !has_content {
-        Ok(0)
+        return Ok(0);
+    }
+    
+    // 如果内容以分隔符结尾，段数 = 分隔符数量，否则 = 分隔符数量 + 1
+    if last_chunk_ended_with_delimiter {
+        Ok(delimiter_count)
     } else {
         Ok(delimiter_count + 1)
     }
