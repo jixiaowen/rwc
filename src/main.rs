@@ -1,4 +1,3 @@
-mod encoding;
 mod processor;
 
 use anyhow::Result;
