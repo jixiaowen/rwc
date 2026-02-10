@@ -152,10 +152,18 @@ fn count_multi_byte_delimiter_streaming(
 
         // 保留末尾可能不完整的部分
         leftover.clear();
-        if combined.len() >= delimiter_len - 1 {
-            let start = combined.len().saturating_sub(delimiter_len - 1);
-            leftover.push_str(&combined[start..]);
-        }
+        let remaining = &combined[last_match_end..];
+        let needed_len = delimiter_len.saturating_sub(1);
+        let suffix_start = if remaining.len() > needed_len {
+            let mut idx = remaining.len() - needed_len;
+            while !remaining.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            idx
+        } else {
+            0
+        };
+        leftover.push_str(&remaining[suffix_start..]);
     }
 
     // 空文件返回0
@@ -225,10 +233,18 @@ fn count_multi_byte_delimiter_stdin(delimiter: &str, encoding: &'static Encoding
         }
 
         leftover.clear();
-        if combined.len() >= delimiter_len - 1 {
-            let start = combined.len().saturating_sub(delimiter_len - 1);
-            leftover.push_str(&combined[start..]);
-        }
+        let remaining = &combined[last_match_end..];
+        let needed_len = delimiter_len.saturating_sub(1);
+        let suffix_start = if remaining.len() > needed_len {
+            let mut idx = remaining.len() - needed_len;
+            while !remaining.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            idx
+        } else {
+            0
+        };
+        leftover.push_str(&remaining[suffix_start..]);
     }
 
     // 空输入返回0
@@ -313,6 +329,24 @@ mod tests {
 
         let count = process_file(file.path(), "\n", "utf8")?;
         assert_eq!(count, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_panic_repro() -> Result<()> {
+        let mut file = NamedTempFile::new()?;
+        // Write "😊" (4 bytes)
+        file.write_all("😊".as_bytes())?;
+        file.flush()?;
+
+        // Delimiter "12" (2 bytes). 
+        // Logic will try to slice at len - (2 - 1) = 4 - 1 = 3.
+        // Index 3 of "😊" is inside the char.
+        let result = process_file(file.path(), "12", "utf8");
+        
+        // Before fix: this would panic.
+        // After fix: should return Ok(1) (0 delimiters, 1 segment).
+        assert!(result.is_ok());
         Ok(())
     }
 }
